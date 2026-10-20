@@ -117,11 +117,14 @@ sudo mkdir -p /etc/systemd/system/ollama.service.d
 sudo tee /etc/systemd/system/ollama.service.d/haswell-compat.conf > /dev/null << 'EOF'
 [Service]
 Environment="OLLAMA_VULKAN=1"
+Environment="OLLAMA_IGPU_ENABLE=1"
 Environment="GGML_VK_ENABLE_HASWELL_COMPAT=1"
 Environment="LLAMA_ARG_FIT=off"
 EOF
 sudo systemctl daemon-reload && sudo systemctl restart ollama
 ```
+
+`OLLAMA_IGPU_ENABLE=1` is required because Ollama ignores integrated GPUs by default.
 
 To revert, restore `libggml-vulkan.so.orig`, remove `haswell-compat.conf` and restart the service. Ollama updates overwrite the library, so repeat the installation after upgrading.
 
