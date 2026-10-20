@@ -797,6 +797,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
+    // Haswell compat: no 16-bit storage, only the Q8_0 x F32 compat matmul is offloaded
+    bool haswell_compat {};
+    // use the compat Q8_0 x F32 kernel (haswell_compat, or forced for testing on other devices)
+    bool compat_mul_mat {};
+    vk_pipeline pipeline_mul_mat_vec_q8_0_compat;
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];

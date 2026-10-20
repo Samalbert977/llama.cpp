@@ -31,6 +31,35 @@ struct vk_mat_vec_push_constants {
     uint32_t broadcast3;
 };
 
+// must match mul_mat_vec_q8_0_compat.comp
+struct vk_mat_vec_q8_0_compat_push_constants {
+    uint32_t ncols;
+    uint32_t nrows;
+    uint32_t ncols_b;
+    uint32_t a_words;
+
+    uint32_t a_offset;
+    uint32_t stride_a;
+    uint32_t batch_stride_a2;
+    uint32_t batch_stride_a3;
+
+    uint32_t b_offset;
+    uint32_t stride_b;
+    uint32_t batch_stride_b2;
+    uint32_t batch_stride_b3;
+
+    uint32_t d_offset;
+    uint32_t stride_d;
+    uint32_t batch_stride_d2;
+    uint32_t batch_stride_d3;
+
+    uint32_t ne12;
+    uint32_t broadcast2;
+    uint32_t broadcast3;
+    uint32_t b_vec4;
+};
+static_assert(sizeof(vk_mat_vec_q8_0_compat_push_constants) == 20 * sizeof(uint32_t), "unexpected padding");
+
 struct vk_mat_vec_p021_push_constants {
     uint32_t ncols_x;
     uint32_t nrows_x;

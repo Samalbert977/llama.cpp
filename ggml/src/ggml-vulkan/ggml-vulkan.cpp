@@ -286,6 +286,18 @@ size_t ggml_vk_descriptor_offset(size_t tensor_offset, size_t alignment, size_t 
 
     return descriptor_offset;
 }
+// Identify the allocation a tensor lives in and its start within it, for device buffers and for
+// host buffers (used by the Haswell compat mode), so overlap checks never misread a host buffer context.
+static void ggml_vk_tensor_location(const ggml_tensor * t, const void *& alloc, size_t & base) {
+    if (ggml_backend_buffer_is_vk(t->buffer)) {
+        alloc = ((ggml_backend_vk_buffer_context *)t->buffer->context)->dev_buffer.get();
+        base = vk_tensor_offset(t) + t->view_offs;
+    } else {
+        alloc = nullptr;
+        base = (size_t)t->data;
+    }
+}
+
 uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
     const size_t tensor_offset = ggml_vk_tensor_buffer_offset(ctx, t);
     const size_t descriptor_offset = ggml_vk_descriptor_offset(
@@ -3250,6 +3262,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_q8_0_compat, "mul_mat_vec_q8_0_compat", mul_mat_vec_q8_0_compat_len, mul_mat_vec_q8_0_compat_data, "main", 3, sizeof(vk_mat_vec_q8_0_compat_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
@@ -4646,12 +4659,26 @@ vk_device ggml_vk_get_device(size_t idx) {
 #endif
         }
 
-        if (!vk11_features.storageBuffer16BitAccess) {
+        const bool haswell_compat =
+            getenv("GGML_VK_ENABLE_HASWELL_COMPAT") != nullptr &&
+            device->properties.vendorID == VK_VENDOR_ID_INTEL &&
+            device->properties.deviceID == 0x0A16;
+
+        if (!vk11_features.storageBuffer16BitAccess && !haswell_compat) {
             std::cerr << "ggml_vulkan: device " << GGML_VK_NAME << idx << " does not support 16-bit storage." << std::endl;
             throw std::runtime_error("Unsupported device");
         }
 
-        device_extensions.push_back("VK_KHR_16bit_storage");
+        if (vk11_features.storageBuffer16BitAccess) {
+            device_extensions.push_back("VK_KHR_16bit_storage");
+        } else {
+            device->haswell_compat = true;
+            std::cerr << "ggml_vulkan: Haswell compatibility mode enabled for "
+                      << device->properties.deviceName
+                      << "; 16-bit storage is unsupported, only Q8_0 x F32 MUL_MAT is offloaded."
+                      << std::endl;
+        }
+        device->compat_mul_mat = device->haswell_compat || getenv("GGML_VK_HASWELL_COMPAT_FORCE_KERNEL") != nullptr;
 
 #ifdef GGML_VULKAN_VALIDATE
         device_extensions.push_back("VK_KHR_shader_non_semantic_info");
@@ -7289,11 +7316,100 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
+static bool ggml_vk_compat_mul_mat_supported(const vk_device & device, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // dim 0 contiguous everywhere, other strides in whole words (the Q8_0 block size of 34 bytes is always 2-aligned)
+    if (src0->nb[0] != ggml_type_size(GGML_TYPE_Q8_0) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    for (int i = 1; i < 4; i++) {
+        if (src1->nb[i] % sizeof(float) != 0 || dst->nb[i] % sizeof(float) != 0) {
+            return false;
+        }
+    }
+    if (src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] % src0->ne[3] != 0) {
+        return false;
+    }
+    // 32-bit indexing only, with headroom for descriptor misalignment
+    const uint64_t max_range = device->properties.limits.maxStorageBufferRange;
+    const uint64_t headroom = device->properties.limits.minStorageBufferOffsetAlignment + ggml_type_size(GGML_TYPE_Q8_0) + 4;
+    if (ggml_nbytes(src0) + headroom > max_range || ggml_nbytes(src1) + headroom > max_range || ggml_nbytes(dst) + headroom > max_range) {
+        return false;
+    }
+    const uint32_t * max_wg = device->properties.limits.maxComputeWorkGroupCount;
+    if ((uint64_t)CEIL_DIV(src1->ne[1], 4) > max_wg[1] || (uint64_t)(src1->ne[2] * src1->ne[3]) > max_wg[2]) {
+        return false;
+    }
+    return true;
+}
+
+static void ggml_vk_mul_mat_q8_0_compat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    VK_LOG_DEBUG("ggml_vk_mul_mat_q8_0_compat(" << src0 << ", " << src1 << ", " << dst << ")");
+    // NUM_ROWS and NUM_COLS in mul_mat_vec_q8_0_compat.comp
+    constexpr uint32_t num_rows = 4;
+    constexpr uint32_t num_cols = 4;
+
+    static std::once_flag logged;
+    std::call_once(logged, [&] { GGML_LOG_INFO("ggml_vulkan: %s: using compat Q8_0 x F32 MUL_MAT kernel\n", ctx->device->name.c_str()); });
+
+    vk_pipeline pipeline = ctx->device->pipeline_mul_mat_vec_q8_0_compat;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer d_A = ggml_vk_tensor_subbuffer(ctx, src0, true);
+    vk_subbuffer d_B = ggml_vk_tensor_subbuffer(ctx, src1, true);
+    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    // The shader reads A as whole 32-bit words, so the last block may need up to 2 bytes past the tensor end.
+    // Bind those bytes if the allocation has them, otherwise the shader reads them as zero.
+    const uint64_t a_size_rounded = ROUNDUP_POW2(d_A.size, 4);
+    if (d_A.offset + a_size_rounded <= d_A.buffer->size) {
+        d_A.size = a_size_rounded;
+    } else {
+        GGML_LOG_WARN("ggml_vulkan: compat Q8_0 tensor %s ends unaligned at the end of its buffer\n", src0->name);
+    }
+
+    const uint32_t a_misalign = get_misalign_bytes(ctx, src0);
+    const uint32_t b_misalign = get_misalign_bytes(ctx, src1);
+    const uint32_t d_misalign = get_misalign_bytes(ctx, dst);
+    GGML_ASSERT(b_misalign % sizeof(float) == 0 && d_misalign % sizeof(float) == 0);
+
+    const uint32_t b_offset = b_misalign / 4;
+    const uint32_t stride_b = src1->nb[1] / 4, batch_stride_b2 = src1->nb[2] / 4, batch_stride_b3 = src1->nb[3] / 4;
+    const uint32_t b_vec4 = (b_offset | stride_b | batch_stride_b2 | batch_stride_b3) % 4 == 0;
+
+    const vk_mat_vec_q8_0_compat_push_constants pc = {
+        (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src1->ne[1], (uint32_t)(d_A.size / 4),
+        a_misalign, (uint32_t)src0->nb[1], (uint32_t)src0->nb[2], (uint32_t)src0->nb[3],
+        b_offset, stride_b, batch_stride_b2, batch_stride_b3,
+        d_misalign / 4, (uint32_t)(dst->nb[1] / 4), (uint32_t)(dst->nb[2] / 4), (uint32_t)(dst->nb[3] / 4),
+        (uint32_t)src1->ne[2], (uint32_t)(src1->ne[2] / src0->ne[2]), (uint32_t)(src1->ne[3] / src0->ne[3]),
+        b_vec4,
+    };
+
+    // one workgroup per num_rows rows (the shader loops if there are more than fit in a dispatch) and per num_cols columns
+    const uint32_t wg_x = (uint32_t)std::min<int64_t>(CEIL_DIV(src0->ne[1], num_rows), ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    const uint32_t wg_y = (uint32_t)CEIL_DIV(src1->ne[1], num_cols);
+    const uint32_t wg_z = (uint32_t)(src1->ne[2] * src1->ne[3]);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_A, d_B, d_D }, pc, { wg_x, wg_y, wg_z });
+}
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
+
+    if (ctx->device->compat_mul_mat && ctx->num_additional_fused_ops == 0 && ggml_vk_compat_mul_mat_supported(ctx->device, dst)) {
+        ggml_vk_mul_mat_q8_0_compat(ctx, subctx, src0, src1, dst);
+        return;
+    }
+    // supports_op only lets the compat case through, the regular shaders need 16-bit storage
+    GGML_ASSERT(!ctx->device->haswell_compat);
 
     // Handle huge A matrix by splitting the M dimensions. This works well for convolution use cases
     // where the M dimension is very large.
@@ -12332,15 +12448,15 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             if (unsynced_nodes.size() == 0) {
                 return false;
             }
-            auto n_base = vk_tensor_offset(node) + node->view_offs;
+            const void * a_buf;
+            size_t n_base;
+            ggml_vk_tensor_location(node, a_buf, n_base);
             auto n_size = ggml_nbytes(node);
-            ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
-            vk_buffer a_buf = a_buf_ctx->dev_buffer;
             for (auto &other : unsynced_nodes) {
-                ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
-                vk_buffer o_buf = o_buf_ctx->dev_buffer;
+                const void * o_buf;
+                size_t o_base;
+                ggml_vk_tensor_location(other, o_buf, o_base);
                 if (a_buf == o_buf) {
-                    auto o_base = vk_tensor_offset(other) + other->view_offs;
                     auto o_size = ggml_nbytes(other);
 
                     if ((o_base <= n_base && n_base < o_base + o_size) ||
@@ -13268,6 +13384,8 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
     return &ctx->device->buffer_type;
 }
 
+static void ggml_backend_vk_synchronize(ggml_backend_t backend);
+
 static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
@@ -13275,6 +13393,15 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
     GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
 
     if (size == 0) {
+        return;
+    }
+
+    if (!ggml_backend_buffer_is_vk(tensor->buffer)) {
+        // pinned host memory (Haswell compat mode): wait for queued work, then copy on the CPU
+        ggml_backend_vk_synchronize(backend);
+        for (size_t i = 0; i < n_copies; i++) {
+            memcpy((char *)tensor->data + offset + i * stride_tensor, (const char *)data + i * stride_data, size);
+        }
         return;
     }
 
@@ -13341,6 +13468,15 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
         return;
     }
 
+    if (!ggml_backend_buffer_is_vk(tensor->buffer)) {
+        // pinned host memory (Haswell compat mode): wait for queued work, then copy on the CPU
+        ggml_backend_vk_synchronize(backend);
+        for (size_t i = 0; i < n_copies; i++) {
+            memcpy((char *)data + i * stride_data, (const char *)tensor->data + offset + i * stride_tensor, size);
+        }
+        return;
+    }
+
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -13396,7 +13532,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         return true;
     }
 
-    if (dst->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend_dst)) {
+    if (dst->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend_dst) || !ggml_backend_buffer_is_vk(dst->buffer)) {
         return false;
     }
 
@@ -14160,14 +14296,13 @@ bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgr
 }
 
 bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
-    ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)a->buffer->context;
-    vk_buffer a_buf = a_buf_ctx->dev_buffer;
-    ggml_backend_vk_buffer_context * b_buf_ctx = (ggml_backend_vk_buffer_context *)b->buffer->context;
-    vk_buffer b_buf = b_buf_ctx->dev_buffer;
+    const void * a_buf;
+    const void * b_buf;
+    size_t a_base, b_base;
+    ggml_vk_tensor_location(a, a_buf, a_base);
+    ggml_vk_tensor_location(b, b_buf, b_base);
     if (a_buf == b_buf) {
-        auto a_base = vk_tensor_offset(a) + a->view_offs;
         auto a_size = ggml_nbytes(a);
-        auto b_base = vk_tensor_offset(b) + b->view_offs;
         auto b_size = ggml_nbytes(b);
 
         if (elementwise && a_base == b_base && a_size == b_size) {
@@ -14374,6 +14509,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         } else if (ctx->device->architecture != AMD_GCN && ctx->device->shader_core_count < 24) {
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
+    }
+    // Haswell GT2 is far slower, keep each submission short to stay clear of the i915 hang check
+    if (ctx->device->haswell_compat) {
+        flops_cap = 4'000'000'000ULL;
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
 
@@ -15384,8 +15523,21 @@ static void ggml_backend_vk_device_get_memory(ggml_backend_dev_t device, size_t 
     ggml_backend_vk_get_device_memory(ctx->device, free, total);
 }
 
+static bool ggml_vk_compat_use_host_buffers(size_t device_idx) {
+    // The host buffer type allocates on device 0. With host memory the CPU can run the ops the compat
+    // device cannot (e.g. in-place KV/recurrent cache updates) without copies, which is free on UMA.
+    if (device_idx != 0) {
+        return false;
+    }
+    const vk_device & device = ggml_vk_get_device(device_idx);
+    return device->haswell_compat && device->uma;
+}
+
 static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_backend_dev_t dev) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    if (ggml_vk_compat_use_host_buffers(ctx->device)) {
+        return ggml_backend_vk_host_buffer_type();
+    }
     return ggml_backend_vk_buffer_type(ctx->device);
 }
 
@@ -15451,6 +15603,22 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
     }
     if (!tensor_size_supported(ggml_nbytes(op))) {
         return false;
+    }
+
+    // Without 16-bit storage only the compat matmul can run, everything else stays on the CPU
+    if (device->haswell_compat) {
+        switch (op->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                return true;
+            case GGML_OP_MUL_MAT:
+                return ggml_vk_compat_mul_mat_supported(device, op);
+            default:
+                return false;
+        }
     }
 
     switch (op->op) {
@@ -16094,11 +16262,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 }
 
 static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+
+    if (buft == ggml_backend_vk_host_buffer_type() && ggml_vk_compat_use_host_buffers(ctx->device)) {
+        return true;
+    }
+
     if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
         return false;
     }
 
-    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
 
     return buft_ctx->device->idx == ctx->device;
@@ -16106,6 +16279,11 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
 
 static bool ggml_backend_vk_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * dev_ctx = (ggml_backend_vk_device_context *)dev->context;
+
+    // copying CPU-resident weights to the slow compat device for every batch is never worth it
+    if (ggml_vk_get_device(dev_ctx->device)->haswell_compat) {
+        return false;
+    }
 
     return ggml_vk_get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
@@ -16345,6 +16523,9 @@ bool ggml_vk_instance_debug_utils_ext_available(
 }
 
 bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
+    vk::PhysicalDeviceProperties props;
+    vkdev.getProperties(&props);
+
     VkPhysicalDeviceFeatures2 device_features2;
     device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 
@@ -16355,7 +16536,12 @@ bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
 
     vkGetPhysicalDeviceFeatures2(vkdev, &device_features2);
 
-    return vk11_features.storageBuffer16BitAccess;
+    const bool haswell_compat =
+        getenv("GGML_VK_ENABLE_HASWELL_COMPAT") != nullptr &&
+        props.vendorID == VK_VENDOR_ID_INTEL &&
+        props.deviceID == 0x0A16;
+
+    return vk11_features.storageBuffer16BitAccess || haswell_compat;
 }
 
 bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch) {

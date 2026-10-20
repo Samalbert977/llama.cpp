@@ -1,0 +1,160 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// Q8_0 x F32 -> F32 matrix multiplication for devices without 16-bit or 8-bit storage access.
+// Weights are read as 32-bit words and decoded with integer ops; the fp16 scale uses unpackHalf2x16.
+// Each workgroup computes NUM_ROWS output rows for NUM_COLS columns, rows are walked with a grid-stride loop.
+
+#define BLOCK_SIZE 32
+#define NUM_ROWS 4
+#define NUM_COLS 4
+#define QK8_0 32
+#define Q8_0_BYTES 34
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint ncols;          // ne00, multiple of QK8_0
+    uint nrows;          // ne01
+    uint ncols_b;        // ne11
+    uint a_words;        // number of readable 32-bit words in binding 0
+
+    uint a_offset;       // bytes
+    uint stride_a;       // nb01 in bytes
+    uint batch_stride_a2;// nb02 in bytes
+    uint batch_stride_a3;// nb03 in bytes
+
+    uint b_offset;       // elements
+    uint stride_b;       // nb11 in elements
+    uint batch_stride_b2;
+    uint batch_stride_b3;
+
+    uint d_offset;       // elements
+    uint stride_d;       // nb1 in elements
+    uint batch_stride_d2;
+    uint batch_stride_d3;
+
+    uint ne12;
+    uint broadcast2;     // ne12 / ne02
+    uint broadcast3;     // ne13 / ne03
+    uint b_vec4;         // all B offsets/strides are multiples of 4 elements
+} p;
+
+layout (binding = 0) readonly buffer A { uint data_a[]; };
+layout (binding = 1) readonly buffer B { float data_b[]; };
+layout (binding = 1) readonly buffer B4 { vec4 data_b4[]; };
+layout (binding = 2) writeonly buffer D { float data_d[]; };
+
+shared float tmp[NUM_ROWS * NUM_COLS][BLOCK_SIZE];
+
+uint load_a(uint idx) {
+    return idx < p.a_words ? data_a[idx] : 0u;
+}
+
+vec4 load_b4(uint idx) {
+    if (p.b_vec4 != 0u) {
+        return data_b4[idx >> 2];
+    }
+    return vec4(data_b[idx], data_b[idx + 1], data_b[idx + 2], data_b[idx + 3]);
+}
+
+vec4 unpack_i8x4(uint w) {
+    const int i = int(w);
+    return vec4(bitfieldExtract(i, 0, 8), bitfieldExtract(i, 8, 8), bitfieldExtract(i, 16, 8), bitfieldExtract(i, 24, 8));
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint col0 = gl_WorkGroupID.y * NUM_COLS;
+
+    const uint i12 = gl_WorkGroupID.z % p.ne12;
+    const uint i13 = gl_WorkGroupID.z / p.ne12;
+    const uint i02 = i12 / p.broadcast2;
+    const uint i03 = i13 / p.broadcast3;
+
+    const uint a_batch = p.a_offset + i02 * p.batch_stride_a2 + i03 * p.batch_stride_a3;
+    const uint b_batch = p.b_offset + i12 * p.batch_stride_b2 + i13 * p.batch_stride_b3;
+    const uint d_batch = p.d_offset + i12 * p.batch_stride_d2 + i13 * p.batch_stride_d3;
+
+    const uint num_blocks = p.ncols / QK8_0;
+
+    for (uint row0 = gl_WorkGroupID.x * NUM_ROWS; row0 < p.nrows; row0 += gl_NumWorkGroups.x * NUM_ROWS) {
+        float acc[NUM_ROWS * NUM_COLS];
+        [[unroll]] for (uint i = 0; i < NUM_ROWS * NUM_COLS; ++i) {
+            acc[i] = 0.0;
+        }
+
+        for (uint blk = tid; blk < num_blocks; blk += BLOCK_SIZE) {
+            float d[NUM_ROWS];
+            uint q[NUM_ROWS][8];
+
+            [[unroll]] for (uint r = 0; r < NUM_ROWS; ++r) {
+                d[r] = 0.0;
+                [[unroll]] for (uint i = 0; i < 8; ++i) {
+                    q[r][i] = 0u;
+                }
+                if (row0 + r < p.nrows) {
+                    // Blocks are 34 bytes, so the start is always 2-byte aligned but only every other block is 4-byte aligned.
+                    const uint base = a_batch + (row0 + r) * p.stride_a + blk * Q8_0_BYTES;
+                    const uint w0 = base >> 2;
+                    const uint first = load_a(w0);
+                    if ((base & 2u) != 0u) {
+                        // scale in the high half of word 0, quants start at word 1
+                        d[r] = unpackHalf2x16(first >> 16).x;
+                        [[unroll]] for (uint i = 0; i < 8; ++i) {
+                            q[r][i] = load_a(w0 + 1 + i);
+                        }
+                    } else {
+                        // scale in the low half of word 0, quants start 2 bytes in
+                        d[r] = unpackHalf2x16(first).x;
+                        uint prev = first;
+                        [[unroll]] for (uint i = 0; i < 8; ++i) {
+                            const uint next = load_a(w0 + 1 + i);
+                            q[r][i] = (prev >> 16) | (next << 16);
+                            prev = next;
+                        }
+                    }
+                }
+            }
+
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                if (col0 + c < p.ncols_b) {
+                    const uint b_base = b_batch + (col0 + c) * p.stride_b + blk * QK8_0;
+                    float sum[NUM_ROWS];
+                    [[unroll]] for (uint r = 0; r < NUM_ROWS; ++r) {
+                        sum[r] = 0.0;
+                    }
+                    [[unroll]] for (uint i = 0; i < 8; ++i) {
+                        const vec4 b = load_b4(b_base + 4*i);
+                        [[unroll]] for (uint r = 0; r < NUM_ROWS; ++r) {
+                            sum[r] += dot(unpack_i8x4(q[r][i]), b);
+                        }
+                    }
+                    [[unroll]] for (uint r = 0; r < NUM_ROWS; ++r) {
+                        acc[r * NUM_COLS + c] += d[r] * sum[r];
+                    }
+                }
+            }
+        }
+
+        [[unroll]] for (uint i = 0; i < NUM_ROWS * NUM_COLS; ++i) {
+            tmp[i][tid] = acc[i];
+        }
+        barrier();
+
+        if (tid < NUM_ROWS * NUM_COLS) {
+            const uint row = row0 + tid / NUM_COLS;
+            const uint col = col0 + tid % NUM_COLS;
+            if (row < p.nrows && col < p.ncols_b) {
+                float total = 0.0;
+                [[unroll]] for (uint i = 0; i < BLOCK_SIZE; ++i) {
+                    total += tmp[tid][i];
+                }
+                data_d[d_batch + col * p.stride_d + row] = total;
+            }
+        }
+        // tmp is reused by the next set of rows
+        barrier();
+    }
+}

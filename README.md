@@ -17,6 +17,9 @@
 
 </div>
 
+> [!NOTE]
+> **About this fork.** This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) that adds an experimental, opt-in Vulkan compatibility mode for Intel Haswell integrated GPUs (HD Graphics 4400), which lack the 16-bit storage support required by the upstream Vulkan backend. It provides a dedicated Q8_0 matrix multiplication kernel that does not rely on unsupported device features. See [docs/backend/VULKAN-HASWELL.md](docs/backend/VULKAN-HASWELL.md) for design, usage, validation results and limitations. The rest of this README is the upstream documentation.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
